@@ -87,3 +87,43 @@ Check/audit linked devices from the primary:
 signal-cli -u <phone-number-E164> listDevices
 signal-cli -u <phone-number-E164> removeDevice -d <device-id>   # to unlink one
 ```
+
+## email-signal-forwarder — DR standby
+
+This machine hosts a **disaster-recovery standby** copy of the Signal email forwarder that normally runs on DreamFyre (see `dreamfyre-ops`). It exists to take over if DreamFyre goes down — **it is not meant to run at the same time as DreamFyre's copy.**
+
+- **Source:** [`Adventurer2021/signal-tools`](https://github.com/Adventurer2021/signal-tools) — same scripts as DreamFyre (`signal_email_forwarder.py`, `mailfilter.py`, `mailfilter_tui.py`).
+- **Layout on this host (unlike DreamFyre, these are separate copies, not a symlink):**
+  - `/home/ryost/signal_email_forwarder.py` — the deployed copy the service actually runs.
+  - `/home/ryost/ops/signal_email_forwarder.py` — dev/tracked copy. **Keep these in sync manually** — editing one does not update the other.
+  - `/usr/local/bin/mailfilter.py` — symlink → `/home/ryost/ops/mailfilter.py`, so it's callable bare from anywhere on `PATH`.
+  - `/home/ryost/ops/mailfilter_tui.py` — Textual TUI front-end, prototype, not linked onto `PATH`. Neither `mailfilter.py` nor `mailfilter_tui.py` is scheduled anywhere (no cron, no systemd) — both are run manually.
+- **Service:** `email-signal-forwarder.service` (`/etc/systemd/system/`), description `"Signal Email Forwarder (DR standby - AlmaLinux)"`.
+  ```ini
+  [Unit]
+  Description=Signal Email Forwarder (DR standby - AlmaLinux)
+  After=network-online.target docker.service
+  Wants=network-online.target
+
+  [Service]
+  Type=simple
+  User=ryost
+  WorkingDirectory=/home/ryost
+  ExecStart=/usr/bin/python3 /home/ryost/signal_email_forwarder.py
+  Restart=on-failure
+  RestartSec=10
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+  **Normal state: stopped and disabled.** It was found running for ~14h alongside DreamFyre's own active instance (2026-09-14) — both were forwarding the same mailboxes to the same Signal number simultaneously — and was stopped. Only start it during a confirmed DreamFyre outage, and stop it again once DreamFyre recovers:
+  ```bash
+  sudo systemctl start email-signal-forwarder.service    # begin failover
+  sudo systemctl stop email-signal-forwarder.service     # end failover, once DreamFyre is back
+  ```
+
+### signal-cli-rest-api (Docker)
+
+Defined in `~/ops/signal-cli-rest-api-compose.yml`. This is an **independent linked device** on the same Signal number (`+19194005511`) as DreamFyre — paired via its own QR code, not a re-registration of DreamFyre's session. Its container mounts `~/.local/share/signal-cli` for account/session state. Normal state matches the forwarder service: **stopped**, started only during failover.
+
+**Important — data directory conflict:** this host also has a separate, standalone `signal-cli` binary installed (`/usr/local/bin/signal-cli → /opt/signal-cli-0.14.8/bin/signal-cli`, see the CLI section above). It shares no code with the Docker container, but both would use the *same* `~/.local/share/signal-cli` config directory by default. **Never run the host `signal-cli` binary and the `signal-cli-rest-api` container against that directory at the same time** — concurrent access risks session/lock corruption on the linked-device state. If you need the CLI for ad-hoc use (e.g. re-linking, listing devices), stop the container first.
